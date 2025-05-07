@@ -1,0 +1,1 @@
+[{"input_features":["semi_major_axis","bstar","eccentricity","mean_motion"],"sequence_length":100,"amr_range":[0.001,0.01]}]

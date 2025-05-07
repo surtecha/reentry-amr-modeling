@@ -1,74 +1,110 @@
 import os
+import configparser
+import requests
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-import math
 import re
-import configparser
-import argparse
+import math
+import pickle
+import json
+import time
 from scipy import interpolate
-import joblib  # For loading the scaler
-import tensorflow as tf
-from spacetrack import SpaceTrackClient
+from tensorflow.keras.models import load_model
 import warnings
-import logging
+import argparse
 
-# --- Configuration & Constants ---
-CONFIG_FILE = 'config.ini'
-SEQUENCE_LENGTH = 100  # Must match the training sequence length
-FEATURES = ['apogee_altitude', 'mean_motion', 'mean_motion_derivative', 'inclination', 'eccentricity']
-NUM_FEATURES = len(FEATURES)
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
-# --- Orbital Mechanics Constants (from your first script) ---
+# Constants for TLE processing
 GM = 398600441800000.0
-GM13 = GM ** (1.0 / 3.0)
-MRAD = 6378.137  # Earth radius in km
+GM13 = GM ** (1.0/3.0)
+MRAD = 6378.137
 PI = math.pi
 TPI86 = 2.0 * PI / 86400.0
 
-# --- Suppress TensorFlow/Scipy/Spacetrack Warnings ---
-# Suppress excessive TensorFlow logging
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # ERROR level
-tf.get_logger().setLevel('ERROR')
-# Suppress specific warnings if needed
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning, module='joblib')
-warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in multiply") # From potential NaN in TLE calcs
-# Suppress spacetrack INFO logs for cleaner output
-logging.getLogger('spacetrack.base').setLevel(logging.WARNING)
+# Directories
+MODEL_DIR = 'model_output'
+TEMP_DIR = 'temp_data'
+OUTPUT_DIR = 'prediction_results'
 
+# Create necessary directories
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --- Helper Functions (Adapted from your scripts) ---
+def parse_config():
+    """Parse the config.ini file for Space-Track credentials"""
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    
+    if 'spacetrack' not in config:
+        raise ValueError("Missing 'spacetrack' section in config.ini")
+    
+    if 'username' not in config['spacetrack'] or 'password' not in config['spacetrack']:
+        raise ValueError("Missing username or password in config.ini")
+    
+    return config['spacetrack']['username'], config['spacetrack']['password']
+
+def login_to_spacetrack(username, password):
+    """Login to Space-Track and return a session"""
+    session = requests.Session()
+    login_url = "https://www.space-track.org/ajaxauth/login"
+    credentials = {"identity": username, "password": password}
+    
+    response = session.post(login_url, data=credentials)
+    
+    if response.status_code != 200:
+        raise ConnectionError(f"Failed to login to Space-Track: {response.status_code}")
+    
+    return session
+
+def fetch_tle_data(session, norad_id, months=6):
+    """Fetch TLE data for a specific NORAD ID for the last N months"""
+    print(f"Fetching TLE data for NORAD ID {norad_id} (last {months} months)...")
+    
+    # Calculate the date range
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=30*months)
+    
+    # Format dates for the query
+    start_str = start_date.strftime('%Y-%m-%d')
+    end_str = end_date.strftime('%Y-%m-%d')
+    
+    # Build the query URL
+    query_url = (
+        f"https://www.space-track.org/basicspacedata/query/class/tle/"
+        f"NORAD_CAT_ID/{norad_id}/EPOCH/{start_str}--{end_str}/"
+        f"orderby/EPOCH/format/tle"
+    )
+    
+    response = session.get(query_url)
+    
+    if response.status_code != 200:
+        raise ConnectionError(f"Failed to fetch data: {response.status_code}")
+    
+    return response.text
 
 def tle_epoch_to_datetime(tle_epoch_str):
-    """Converts TLE epoch string to datetime object."""
-    try:
-        year_short = int(tle_epoch_str[:2])
-        day_of_year_fraction = float(tle_epoch_str[2:])
-
-        if year_short < 57:
-            year = 2000 + year_short
-        else:
-            year = 1900 + year_short
-
-        start_of_year = datetime(year, 1, 1)
-        # day_of_year_fraction includes the integer part (day number) and fractional part (time)
-        # timedelta needs days, so subtract 1 from the integer part
-        delta = timedelta(days=(day_of_year_fraction - 1))
-        epoch_datetime = start_of_year + delta
-        return epoch_datetime
-    except ValueError:
-        print(f"Error parsing TLE epoch string: {tle_epoch_str}")
-        return None
+    """Convert TLE epoch string to datetime object"""
+    year_short = int(tle_epoch_str[:2])
+    day_of_year_fraction = float(tle_epoch_str[2:])
+    
+    if year_short < 57:
+        year = 2000 + year_short
+    else:
+        year = 1900 + year_short
+    
+    start_of_year = datetime(year, 1, 1)
+    delta_days = timedelta(days=(day_of_year_fraction - 1))
+    epoch_datetime = start_of_year + delta_days
+    return epoch_datetime
 
 def parse_scientific_notation(field):
-    """Parses TLE scientific notation fields (like BSTAR)."""
+    """Parse scientific notation fields in TLE"""
     field = field.strip()
-    # Handle explicit zero first
-    if field == '00000+0' or field == '.00000+0' or field == '+00000+0' or field == '-00000+0':
-         return 0.0
-    # Regex for standard scientific notation like " 12345-5" or "-12345+1"
-    match = re.match(r'([ +-])?(\d{5})([+-]\d)', field)
+    match = re.match(r'([ +-])?(\d+)([+-]\d)', field)
     if match:
         sign_char, mantissa_str, exponent_str = match.groups()
         sign = -1.0 if sign_char == '-' else 1.0
@@ -76,16 +112,15 @@ def parse_scientific_notation(field):
         exponent = int(exponent_str)
         return sign * mantissa * (10 ** exponent)
     else:
-        # Fallback for potentially simpler formats or errors
         try:
-            # Check if it's just a plain number (though not typical for BSTAR)
-            return float(field)
+            if float(field) == 0.0:
+                return 0.0
         except ValueError:
-            print(f"Warning: Could not parse scientific notation: '{field}'")
-            return None # Indicate parsing failure
+            pass
+        return None
 
-def parse_tle_data(tle_lines):
-    """Parses raw TLE lines into a DataFrame with orbital parameters."""
+def parse_tle_data(tle_data, norad_id):
+    """Parse TLE data into a pandas DataFrame"""
     epochs = []
     epochs_utc = []
     perigee_altitudes = []
@@ -95,102 +130,68 @@ def parse_tle_data(tle_lines):
     inclinations = []
     eccentricities = []
     bstars = []
-
+    semi_major_axes = []
+    
+    lines = tle_data.strip().split('\n')
+    
     i = 0
-    while i < len(tle_lines) - 1:
-        line1 = tle_lines[i].strip()
-        line2 = tle_lines[i + 1].strip()
-
-        # Basic TLE format check
-        if line1.startswith('1 ') and line2.startswith('2 ') and len(line1) >= 69 and len(line2) >= 69:
+    while i < len(lines) - 1:
+        line1 = lines[i].strip()
+        line2 = lines[i+1].strip()
+        
+        if line1.startswith('1 ') and line2.startswith('2 '):
             try:
-                # --- Line 1 Parsing ---
                 epoch_str = line1[18:32].strip()
-                first_deriv_str = line1[33:43].strip() # First derivative of mean motion / 2
-                bstar_str = line1[53:61].strip()       # BSTAR drag term
-
-                # --- Line 2 Parsing ---
-                inclination_deg = float(line2[8:16].strip())
-                eccentricity_str = line2[26:33].strip() # Assumed decimal point
-                mean_motion_rev_day = float(line2[52:63].strip())
-
-                # --- Calculations & Conversions ---
                 epoch_dt = tle_epoch_to_datetime(epoch_str)
-                if epoch_dt is None: # Skip if epoch parsing failed
+                epoch_utc = epoch_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                
+                first_deriv_str = line1[33:43].strip()
+                bstar_str = line1[53:61].strip()
+                
+                inclination_deg = float(line2[8:16].strip())
+                eccentricity_str = line2[26:33].strip()
+                mean_motion_rev_day = float(line2[52:63].strip())
+                
+                eccentricity = float(f'0.{eccentricity_str}')
+                first_deriv = float(first_deriv_str) * 2.0
+                bstar = parse_scientific_notation(bstar_str)
+                
+                if bstar is None:
                     i += 2
                     continue
-                epoch_utc = epoch_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-
-                # Handle potential missing decimal point in eccentricity
-                if '.' not in eccentricity_str:
-                     eccentricity = float(f'0.{eccentricity_str}')
-                else:
-                     eccentricity = float(eccentricity_str) # Should not happen per format, but safe check
-
-                # First derivative is divided by 2 in TLE line 1
-                # The training script multiplied by 2, so we do the same here
-                # Convert from rev/day^2 to rev/day^2 (no change needed here, just naming)
-                mean_motion_dot = float(first_deriv_str) * 2.0
-
-                bstar = parse_scientific_notation(bstar_str)
-                if bstar is None: # Skip if BSTAR parsing failed
-                     print(f"Skipping TLE pair due to BSTAR parsing error: {bstar_str}")
-                     i += 2
-                     continue
-
+                
                 mmoti = mean_motion_rev_day
                 ecc = eccentricity
-
-                # Basic validity checks
-                if mmoti <= 0 or ecc < 0 or ecc >= 1.0:
-                    print(f"Skipping TLE pair due to invalid orbital elements: MM={mmoti}, e={ecc}")
+                
+                if mmoti <= 0:
                     i += 2
                     continue
-
-                # Calculate Semi-Major Axis (SMA) in km
-                # mm_rad_sec = mmoti * TPI86 # Mean motion in radians per second
-                # sma_meters = GM13 / (mm_rad_sec ** (2.0 / 3.0)) # Old formula seems to use GM^(1/3) incorrectly
-                # Correct formula for SMA from mean motion: a = (GM / n^2)^(1/3) where n is in rad/s
-                n_rad_per_sec = mmoti * (2 * PI) / 86400.0
-                sma_meters = (GM / (n_rad_per_sec**2))**(1/3.0)
-                sma_km = sma_meters / 1000.0
-
-                # Calculate Apogee and Perigee Altitude in km
-                apo_km = sma_km * (1.0 + ecc)
-                per_km = sma_km * (1.0 - ecc)
-                apo_alt_km = apo_km - MRAD
-                per_alt_km = per_km - MRAD
-
-                # Append data
+                
+                sma = GM13 / ((TPI86 * mmoti) ** (2.0 / 3.0)) / 1000.0
+                apo = sma * (1.0 + ecc) - MRAD
+                per = sma * (1.0 - ecc) - MRAD
+                
                 epochs.append(epoch_dt)
                 epochs_utc.append(epoch_utc)
-                perigee_altitudes.append(per_alt_km)
-                apogee_altitudes.append(apo_alt_km)
+                perigee_altitudes.append(per)
+                apogee_altitudes.append(apo)
                 mean_motions.append(mean_motion_rev_day)
-                mean_motion_derivatives.append(mean_motion_dot) # Use the value * 2
+                mean_motion_derivatives.append(first_deriv)
                 inclinations.append(inclination_deg)
                 eccentricities.append(eccentricity)
                 bstars.append(bstar)
-
-                i += 2 # Move to the next TLE pair
-            except ValueError as e:
-                print(f"Skipping TLE pair due to ValueError during processing: {e}")
-                print(f"  Line 1: {line1}")
-                print(f"  Line 2: {line2}")
+                semi_major_axes.append(sma)
+                
                 i += 2
             except Exception as e:
-                print(f"Skipping TLE pair due to unexpected error: {e}")
-                print(f"  Line 1: {line1}")
-                print(f"  Line 2: {line2}")
+                print(f"Error parsing TLE entry: {str(e)}")
                 i += 2
         else:
-            # Move one line forward if the current pair doesn't match TLE format
             i += 1
-
+    
     if not epochs:
-        return pd.DataFrame() # Return empty DataFrame if no valid TLEs parsed
-
-    # Create DataFrame
+        raise ValueError("No valid TLE entries found")
+    
     data = pd.DataFrame({
         'epoch': epochs,
         'epoch_utc': epochs_utc,
@@ -200,255 +201,353 @@ def parse_tle_data(tle_lines):
         'mean_motion_derivative': mean_motion_derivatives,
         'inclination': inclinations,
         'eccentricity': eccentricities,
-        'bstar': bstars
+        'bstar': bstars,
+        'semi_major_axis': semi_major_axes
     })
-
-    # Sort by epoch just in case TLEs weren't perfectly ordered
+    
     data = data.sort_values(by='epoch').reset_index(drop=True)
+    
+    # Save raw data
+    raw_filepath = os.path.join(TEMP_DIR, f"{norad_id}_raw.csv")
+    data.to_csv(raw_filepath, index=False)
+    
+    print(f"Parsed {len(data)} TLE entries")
     return data
 
+def detect_maneuver_or_change(df, column='perigee_altitude', threshold=10):
+    """
+    Detect significant changes in orbital parameters that might indicate a maneuver or decay start.
+    Returns indices where significant changes occur.
+    """
+    changes = []
+    if len(df) < 3:
+        return changes
+    
+    # Calculate rate of change
+    df['gradient'] = df[column].diff() / df['epoch'].diff().dt.total_seconds()
+    
+    # Calculate standard deviation of gradient
+    std_grad = df['gradient'].std()
+    if pd.isna(std_grad) or std_grad == 0:
+        return changes
+    
+    # Identify points where gradient exceeds threshold * standard deviation
+    for i in range(1, len(df)-1):
+        if abs(df['gradient'].iloc[i]) > threshold * std_grad:
+            changes.append(i)
+    
+    # Remove the temporary column
+    df.drop('gradient', axis=1, inplace=True)
+    
+    return changes
 
-def parse_datetime_resample(dt_str):
-    """Parses datetime strings used during resampling."""
-    try:
-        # Try ISO format with microseconds
-        return datetime.strptime(dt_str, '%Y-%m-%dT%H:%M:%S.%fZ')
-    except ValueError:
-        try:
-            # Try ISO format without microseconds (if original data had it)
-             return datetime.strptime(dt_str, '%Y-%m-%dT%H:%M:%SZ')
-        except ValueError:
-             # Fallback for pandas default if needed (less likely)
-             return pd.to_datetime(dt_str)
+def segment_data(df):
+    """
+    Segment the data based on detected maneuvers or changes.
+    Returns a list of dataframes, each representing a segment.
+    """
+    # Detect changes in perigee altitude (most sensitive to decay)
+    change_indices = detect_maneuver_or_change(df, 'perigee_altitude')
+    
+    # If no significant changes, try apogee
+    if not change_indices:
+        change_indices = detect_maneuver_or_change(df, 'apogee_altitude')
+    
+    # If still no changes, try mean motion
+    if not change_indices:
+        change_indices = detect_maneuver_or_change(df, 'mean_motion', threshold=5)
+    
+    # Sort and deduplicate change points
+    change_indices = sorted(set(change_indices))
+    
+    # Create segments
+    segments = []
+    start_idx = 0
+    
+    for idx in change_indices:
+        if idx - start_idx > 2:  # Ensure segment has at least 3 points
+            segments.append(df.iloc[start_idx:idx+1])
+        start_idx = idx + 1
+    
+    # Add the final segment
+    if len(df) - start_idx > 2:
+        segments.append(df.iloc[start_idx:])
+    
+    return segments
 
+def select_decay_segment(segments):
+    """
+    Select the segment that most likely represents orbital decay.
+    Typically the last segment with decreasing altitude or increasing mean motion.
+    """
+    if not segments:
+        return None
+    
+    # First check if the last segment shows decreasing altitude
+    last_segment = segments[-1]
+    if len(last_segment) >= 5:
+        # Check if there's a clear downward trend in perigee
+        first_perigee = last_segment['perigee_altitude'].iloc[0]
+        last_perigee = last_segment['perigee_altitude'].iloc[-1]
+        
+        if last_perigee < first_perigee and (first_perigee - last_perigee) / first_perigee > 0.05:
+            return last_segment
+    
+    # If the last segment doesn't show clear decay, check all segments
+    for segment in reversed(segments):  # Check from the last segment backward
+        if len(segment) >= 5:
+            # Check for consistent decay pattern
+            perigee_trend = segment['perigee_altitude'].iloc[-1] - segment['perigee_altitude'].iloc[0]
+            mean_motion_trend = segment['mean_motion'].iloc[-1] - segment['mean_motion'].iloc[0]
+            
+            # Decay is characterized by decreasing altitude and increasing mean motion
+            if perigee_trend < 0 and mean_motion_trend > 0:
+                return segment
+    
+    # If no segment shows clear decay, return the last segment if it has enough points
+    if len(segments[-1]) >= 5:
+        return segments[-1]
+    elif len(segments) > 1 and len(segments[-2]) >= 5:
+        return segments[-2]
+    
+    # Last resort: return the longest segment
+    return max(segments, key=len) if segments else None
 
-def resample_dataframe(df, n_points=SEQUENCE_LENGTH):
-    """Resamples the DataFrame to a fixed number of points using interpolation."""
-    if len(df) < 2:
-        print(f"Warning: Cannot interpolate with less than 2 data points. Returning original data (length {len(df)}).")
-        # If needed, pad or truncate here to exactly n_points, but interpolation isn't possible.
-        # For simplicity, we'll let the calling function handle size mismatch.
-        return df
+def adaptive_resampling(df, target_points=100):
+    """
+    Adaptively resample the data to focus more points on rapid changes.
+    Uses a weighted approach that increases point density where changes are faster.
+    """
+    if len(df) < 4:
+        return df  # Not enough points for resampling
+    
+    # Convert epoch to numeric for calculations
+    df = df.copy()
+    first_timestamp = df['epoch'].min()
+    df['epoch_seconds'] = (df['epoch'] - first_timestamp).dt.total_seconds()
+    
+    # Calculate importance weights based on rate of change of perigee_altitude
+    df['weight'] = abs(df['perigee_altitude'].diff()) + 0.1  # Add small constant to avoid zeros
+    # Fill NA values with mean
+    df['weight'].fillna(df['weight'].mean(), inplace=True)
+    
+    # Calculate cumulative weights
+    cumulative_weights = df['weight'].cumsum()
+    total_weight = cumulative_weights.iloc[-1]
+    
+    # Create points distributed according to weights
+    new_cum_weights = np.linspace(0, total_weight, target_points)
+    
+    # Find corresponding indices in original data
+    indices = []
+    for w in new_cum_weights:
+        idx = np.argmin(abs(cumulative_weights - w))
+        indices.append(idx)
+    
+    # Create the resampled dataframe
+    resampled_df = df.iloc[indices].copy()
+    resampled_df.sort_values('epoch_seconds', inplace=True)
+    
+    # Clean up temporary columns
+    resampled_df = resampled_df.drop(columns=['epoch_seconds', 'weight'])
+    
+    return resampled_df
 
-    # Convert epoch_utc to numeric timestamp for interpolation
-    # Use the specific parsing function to handle potential format variations
-    df['timestamp'] = df['epoch_utc'].apply(lambda x: parse_datetime_resample(x).timestamp())
+def process_tle_data(df, norad_id):
+    """Process TLE data using the same techniques as in decay-analysis.py"""
+    print("Processing TLE data...")
+    
+    # Skip processing if too few points
+    if len(df) < 10:
+        raise ValueError("Not enough TLE data points (minimum 10 required)")
+    
+    # Sort by epoch to ensure chronological order
+    df = df.sort_values('epoch').reset_index(drop=True)
+    
+    # Segment the data
+    segments = segment_data(df)
+    
+    # Select the segment that best represents decay
+    decay_segment = select_decay_segment(segments)
+    
+    if decay_segment is None or len(decay_segment) < 5:
+        # If no good decay segment, take the last N points or all if fewer
+        n_points = min(100, len(df))
+        decay_segment = df.iloc[-n_points:].copy().reset_index(drop=True)
+    
+    # Apply adaptive resampling to focus on areas of rapid change
+    resampled_df = adaptive_resampling(decay_segment, target_points=100)
+    
+    # Save processed data
+    processed_filepath = os.path.join(TEMP_DIR, f"{norad_id}_processed.csv")
+    resampled_df.to_csv(processed_filepath, index=False)
+    
+    # Create comparison plot
+    plot_comparison(df, decay_segment, resampled_df, norad_id)
+    
+    return resampled_df
 
-    # Ensure data is sorted by time
-    df = df.sort_values('timestamp').reset_index(drop=True)
+def plot_comparison(original_df, decay_df, resampled_df, norad_id):
+    """Create plots comparing original data, detected decay segment, and resampled data."""
+    print("Generating analysis plots...")
+    
+    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+    
+    # Plot columns
+    plot_cols = [('perigee_altitude', 0, 0), ('apogee_altitude', 0, 1), 
+                ('inclination', 1, 0), ('bstar', 1, 1),
+                ('semi_major_axis', 2, 0), ('mean_motion', 2, 1)]
+    
+    for col, row, col_idx in plot_cols:
+        if col in original_df.columns:
+            ax = axes[row, col_idx]
+            
+            # Plot original data
+            ax.plot(original_df['epoch'], original_df[col], 'o', alpha=0.3, label='Original', color='blue')
+            
+            # Plot decay segment
+            if decay_df is not None:
+                ax.plot(decay_df['epoch'], decay_df[col], 'o', alpha=0.7, label='Decay Segment', color='green')
+            
+            # Plot resampled data
+            if resampled_df is not None:
+                ax.plot(resampled_df['epoch'], resampled_df[col], '-', label='Resampled', color='red', linewidth=2)
+            
+            ax.set_title(col.replace('_', ' ').title())
+            ax.legend()
+    
+    plt.suptitle(f"Orbital Parameter Analysis for NORAD ID: {norad_id}", fontsize=16)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, f"{norad_id}_analysis.png"))
+    plt.close()
 
-    # Create interpolation parameters (0 to 1 range)
-    old_indices = np.linspace(0, 1, len(df))
-    new_indices = np.linspace(0, 1, n_points)
+def load_model_and_scalers():
+    """Load the trained model and associated scalers"""
+    print("Loading model and scalers...")
+    
+    # Load model
+    model_path = os.path.join(MODEL_DIR, 'amr_prediction_model.keras')
+    model = load_model(model_path)
+    
+    # Load metadata to get feature names
+    metadata_path = os.path.join(MODEL_DIR, 'model_metadata.json')
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)[0]
+    
+    feature_names = metadata['input_features']
+    seq_length = metadata['sequence_length']
+    
+    # Load feature scalers
+    feature_scalers = []
+    for feature in feature_names:
+        scaler_path = os.path.join(MODEL_DIR, f'{feature}_scaler.pkl')
+        with open(scaler_path, 'rb') as f:
+            scaler = pickle.load(f)
+            feature_scalers.append(scaler)
+    
+    # Load target scaler
+    target_scaler_path = os.path.join(MODEL_DIR, 'target_scaler.pkl')
+    with open(target_scaler_path, 'rb') as f:
+        target_scaler = pickle.load(f)
+    
+    return model, feature_names, feature_scalers, target_scaler
 
-    # Create the new dataframe
-    new_df = pd.DataFrame()
+def prepare_model_input(df, feature_names, feature_scalers, seq_length):
+    """Prepare the processed data for model input"""
+    print("Preparing model input...")
+    
+    # Check if we have enough data points
+    if len(df) != seq_length:
+        raise ValueError(f"Expected {seq_length} data points, but got {len(df)}")
+    
+    # Extract features
+    input_sequences = []
+    
+    for i, feature in enumerate(feature_names):
+        if feature not in df.columns:
+            raise ValueError(f"Feature '{feature}' not found in data")
+        
+        seq = df[feature].values
+        
+        # Apply the appropriate scaler
+        seq_scaled = feature_scalers[i].transform(seq.reshape(-1, 1)).flatten()
+        input_sequences.append(seq_scaled)
+    
+    return input_sequences
 
-    # Interpolate timestamps and convert back to UTC string format
-    timestamp_interp = interpolate.interp1d(old_indices, df['timestamp'].values, kind='linear', fill_value="extrapolate")
-    new_timestamps = timestamp_interp(new_indices)
-    new_datetimes_utc = [datetime.fromtimestamp(ts, tz=None).strftime('%Y-%m-%dT%H:%M:%S.%fZ') for ts in new_timestamps] # Use tz=None for naive datetime
-    new_df['epoch_utc'] = new_datetimes_utc
-    # Optional: Recreate naive 'epoch' column if needed elsewhere, though 'epoch_utc' is standard
-    # new_df['epoch'] = [parse_datetime_resample(dt_str) for dt_str in new_df['epoch_utc']]
+def predict_amr(model, input_sequences, target_scaler):
+    """Use the model to predict AMR value"""
+    print("Predicting AMR value...")
+    
+    # Reshape input for model
+    model_input = [seq.reshape(1, -1) for seq in input_sequences]
+    
+    # Make prediction
+    prediction_scaled = model.predict(model_input)
+    
+    # Inverse transform to get actual AMR
+    prediction = target_scaler.inverse_transform(prediction_scaled)[0][0]
+    
+    return prediction
 
-    # Interpolate all numerical columns required for the model + any others present
-    numeric_columns = df.select_dtypes(include=np.number).columns.tolist()
-    # Ensure 'timestamp' isn't accidentally interpolated if it wasn't dropped yet
-    if 'timestamp' in numeric_columns:
-        numeric_columns.remove('timestamp')
-
-    for col in numeric_columns:
-        if col in df.columns:
-            try:
-                # Use linear interpolation; extrapolate fills ends if needed
-                interp_func = interpolate.interp1d(old_indices, df[col].values, kind='linear', fill_value="extrapolate")
-                new_df[col] = interp_func(new_indices)
-            except ValueError as e:
-                 print(f"Warning: Interpolation failed for column '{col}': {e}. Filling with NaN.")
-                 new_df[col] = np.nan # Or handle differently (e.g., ffill/bfill)
-            except Exception as e:
-                 print(f"Warning: Unexpected error during interpolation for column '{col}': {e}. Filling with NaN.")
-                 new_df[col] = np.nan
-
-    # Ensure the final dataframe has exactly n_points rows
-    if len(new_df) != n_points:
-        print(f"Warning: Resampling resulted in {len(new_df)} rows, expected {n_points}. Adjusting...")
-        if len(new_df) > n_points:
-            new_df = new_df.iloc[:n_points]
-        else: # len(new_df) < n_points (shouldn't happen with linear interpolation/extrapolation)
-             # Pad with the last row if needed
-            while len(new_df) < n_points:
-                new_df = pd.concat([new_df, new_df.iloc[[-1]]], ignore_index=True)
-
-    return new_df
-
-
-# --- Main Execution ---
-def main(norad_id):
-    """Fetches TLEs, preprocesses data, and predicts AMR for a given NORAD ID."""
-    print(f"--- Processing NORAD ID: {norad_id} ---")
-
-    # 1. Load Configuration
-    print("Loading configuration...")
-    config = configparser.ConfigParser()
-    if not os.path.exists(CONFIG_FILE):
-        print(f"Error: Configuration file '{CONFIG_FILE}' not found.")
-        return
-    try:
-        config.read(CONFIG_FILE)
-        st_identity = config['spacetrack']['identity']
-        st_password = config['spacetrack']['password']
-        model_path = config['files']['model_path']
-        scaler_path = config['files']['scaler_path']
-    except KeyError as e:
-        print(f"Error: Missing key in '{CONFIG_FILE}': {e}")
-        return
-    except Exception as e:
-        print(f"Error reading configuration file: {e}")
-        return
-
-    # Validate existence of model and scaler files
-    if not os.path.exists(model_path):
-        print(f"Error: Model file not found at '{model_path}'")
-        return
-    if not os.path.exists(scaler_path):
-        print(f"Error: Scaler file not found at '{scaler_path}'")
-        return
-
-    # 2. Fetch TLE Data from Space-Track
-    print("Connecting to Space-Track...")
-    try:
-        st = SpaceTrackClient(identity=st_identity, password=st_password)
-    except Exception as e:
-        print(f"Error initializing SpaceTrackClient: {e}")
-        return
-
-    print("Fetching TLE data for the last 6 months...")
-    # Calculate date range
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=180) # Approx 6 months
-    date_range_str = f"{start_date.strftime('%Y-%m-%d')}--{end_date.strftime('%Y-%m-%d')}"
-
-    try:
-        # Fetch TLEs in chronological order (ascending epoch)
-        tle_raw = st.tle(
-            norad_cat_id=norad_id,
-            orderby='epoch asc', # Important for correct sequence order
-            epoch=date_range_str,
-            format='tle'
-            )
-
-        if not tle_raw:
-            print(f"No TLE data found for NORAD ID {norad_id} in the last 6 months.")
-            return
-
-        tle_lines = tle_raw.strip().splitlines()
-        print(f"Fetched {len(tle_lines) // 2} TLE pairs.")
-
-    except Exception as e:
-        print(f"Error fetching TLE data from Space-Track: {e}")
-        return
-
-    # 3. Parse TLE Data
-    print("Parsing TLE data...")
-    df_parsed = parse_tle_data(tle_lines)
-
-    if df_parsed.empty:
-        print("No valid TLE data could be parsed.")
-        return
-    elif len(df_parsed) < 2:
-         print(f"Insufficient valid TLE data points ({len(df_parsed)}) for resampling. Need at least 2.")
-         return
-    else:
-        print(f"Successfully parsed {len(df_parsed)} valid TLE data points.")
-        # print(df_parsed.head()) # Optional: Print head for verification
-
-    # 4. Resample Data
-    print(f"Resampling data to {SEQUENCE_LENGTH} points...")
-    df_resampled = resample_dataframe(df_parsed, n_points=SEQUENCE_LENGTH)
-
-    if len(df_resampled) != SEQUENCE_LENGTH:
-         print(f"Error: Resampling did not produce exactly {SEQUENCE_LENGTH} data points (produced {len(df_resampled)}). Cannot proceed.")
-         return
-    elif df_resampled[FEATURES].isnull().values.any():
-         print(f"Error: Resampled data contains NaN values in feature columns. Cannot proceed.")
-         # Optionally, print which columns have NaN:
-         # print(df_resampled.isnull().sum())
-         return
-    else:
-         print("Resampling successful.")
-         # print(df_resampled.head()) # Optional: Print head
-
-    # 5. Load Scaler and Model
-    print("Loading scaler and model...")
-    try:
-        scaler = joblib.load(scaler_path)
-        print(f"Scaler loaded from '{scaler_path}'.")
-        model = tf.keras.models.load_model(model_path)
-        print(f"Model loaded from '{model_path}'.")
-        # model.summary() # Optional: Print model summary
-    except FileNotFoundError:
-        print(f"Error: Could not find model ('{model_path}') or scaler ('{scaler_path}') file.")
-        return
-    except Exception as e:
-        print(f"Error loading scaler or model: {e}")
-        return
-
-    # 6. Prepare Data for Prediction
-    print("Preparing data for prediction...")
-    # Select the features the model was trained on
-    sequence_data = df_resampled[FEATURES].values
-
-    # Check shape before scaling
-    if sequence_data.shape != (SEQUENCE_LENGTH, NUM_FEATURES):
-        print(f"Error: Data shape before scaling is {sequence_data.shape}, expected ({SEQUENCE_LENGTH}, {NUM_FEATURES}).")
-        return
-
-    # Scale the data using the loaded scaler
-    # Scaler expects 2D input: (n_samples * seq_len, n_features)
-    # In this case, n_samples is 1
-    try:
-        sequence_scaled = scaler.transform(sequence_data) # scaler was fit on reshaped data, so transform needs same shape
-    except ValueError as e:
-        print(f"Error during scaling: {e}. Check if feature columns match scaler's expected features.")
-        # This can happen if FEATURES list doesn't match what the scaler was trained on.
-        print(f"Scaler was trained on {scaler.n_features_in_} features.")
-        return
-    except Exception as e:
-        print(f"Unexpected error during scaling: {e}")
-        return
-
-    # Reshape for LSTM input: (batch_size, timesteps, features) -> (1, SEQUENCE_LENGTH, NUM_FEATURES)
-    sequence_final = sequence_scaled.reshape(1, SEQUENCE_LENGTH, NUM_FEATURES)
-    print(f"Data prepared with shape: {sequence_final.shape}")
-
-    # 7. Predict AMR
-    print("Predicting AMR...")
-    try:
-        predicted_amr_array = model.predict(sequence_final)
-        # The prediction is likely [[value]], extract the scalar
-        predicted_amr = predicted_amr_array[0][0]
-        print("--- Prediction Complete ---")
-        print(f"Predicted AMR for NORAD ID {norad_id}: {predicted_amr:.6f}") # Format to 6 decimal places
-    except Exception as e:
-        print(f"Error during prediction: {e}")
-
-# --- Command Line Argument Parsing ---
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Predict AMR for a given NORAD ID using TLE data.")
-    parser.add_argument("norad_id", type=int, help="The NORAD Catalog ID of the satellite.")
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(description='Fetch TLE data and predict AMR for a satellite')
+    parser.add_argument('norad_id', type=str, help='NORAD ID of the satellite')
     args = parser.parse_args()
+    
+    norad_id = args.norad_id
+    
+    try:
+        # Parse configuration
+        username, password = parse_config()
+        
+        # Login to Space-Track
+        session = login_to_spacetrack(username, password)
+        
+        # Fetch TLE data
+        tle_data = fetch_tle_data(session, norad_id)
+        
+        # Parse TLE data
+        df = parse_tle_data(tle_data, norad_id)
+        
+        # Process the data
+        processed_df = process_tle_data(df, norad_id)
+        
+        # Load model and scalers
+        model, feature_names, feature_scalers, target_scaler = load_model_and_scalers()
+        
+        # Prepare input for the model
+        input_sequences = prepare_model_input(processed_df, feature_names, feature_scalers, len(processed_df))
+        
+        # Predict AMR
+        amr_prediction = predict_amr(model, input_sequences, target_scaler)
+        
+        # Output results
+        print("\n" + "="*50)
+        print(f"AMR Prediction Results for NORAD ID: {norad_id}")
+        print("="*50)
+        print(f"Predicted AMR: {amr_prediction:.8f} m²/kg")
+        print(f"Analysis plots saved to: {os.path.join(OUTPUT_DIR, f'{norad_id}_analysis.png')}")
+        print("="*50)
+        
+        # Save result to file
+        result = {
+            'norad_id': norad_id,
+            'prediction_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'predicted_amr': float(amr_prediction),
+            'data_points_used': len(processed_df),
+            'timespan_days': (processed_df['epoch'].max() - processed_df['epoch'].min()).days
+        }
+        
+        result_df = pd.DataFrame([result])
+        result_df.to_csv(os.path.join(OUTPUT_DIR, f"{norad_id}_amr_prediction.csv"), index=False)
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return 1
+    
+    return 0
 
-    main(args.norad_id)
-
-
-'''
-[spacetrack]
-identity = abc@gmail.com
-password = pass
-
-[files]
-model_path = bilstm_amr_predictor.keras  
-scaler_path = feature_scaler.joblib 
-'''
+if __name__ == "__main__":
+    main()
