@@ -1,0 +1,1 @@
+[{"input_features":["semi_major_axis","bstar","eccentricity","mean_motion","apogee_altitude"],"sequence_length":100,"amr_range":[0.001,0.009],"target_transform":"log10"}]
